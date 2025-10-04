@@ -1,3 +1,7 @@
+an optimized version of ironclust with better detection threshold controls, faster merging and splitting.
+written by Shahaf Weiss 2025
+
+
 ![IronClust logo](img/ironclust_logo.png)
 
 # IronClust
@@ -167,4 +171,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 * We thank our collaborators and contributors of the ground-truth datasets to validate our spike sorting accuracy through spikeforest.flatironinstitute.org website.
 * We thank [Loren Frank's lab](https://www.cin.ucsf.edu/HTML/Loren_Frank.html) for contributing the terabyte-scale 10-day continuous recording data.
+
 * We thank [Dan English's lab](https://www.englishneurolab.com/) for contributing four-day uLED probe recordings.
