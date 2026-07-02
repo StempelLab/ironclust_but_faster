@@ -2393,6 +2393,33 @@ end %func
 % rho/delta). S_clu_from_labels_ packages a label vector into a valid S_clu that
 % bypasses postCluster_ (see fet2clu_), and cluster_labels_persite_ runs a given
 % clustering function per detection site (features are local to each spike's site).
+%
+% Architecture / performance:
+%   - cluster_labels_persite_ is the shared driver for all three methods. It clusters
+%     each detection site independently (cluster_site_), then offsets the per-site
+%     labels into a global id space; cross-site duplicates are merged later by
+%     post_merge_ (waveform-based). Each site also gets a global-index kNN graph
+%     (persite_knn_) + density that the waveform post-merge needs.
+%   - The site loop runs in PARALLEL (parfor) across a capped worker pool
+%     (nWorkers_clust, default 12, clamped to #cores), with graceful fallback to a
+%     serial loop. The label offset is applied AFTER the loop (cumsum of per-site
+%     cluster counts) so the loop body carries no shared state; results are identical
+%     to the serial path. Live progress + ETA is printed via progress_persite_.
+%   - cluster_site_ also returns per-site CPU-time split between the clustering
+%     algorithm (t_clu) and the kNN graph (t_knn); the driver reports the summed split
+%     and the slowest sites. Use measure_persite_timing.m to profile this cheaply on
+%     the biggest sites and decide where to optimize (e.g. GPU the kNN only if it
+%     dominates).
+%   - Tail/giant-site handling: a few noise/artifact channels can hold 30x the median
+%     spike count, and both the kNN graph (O(n^2)) and the clustering grow steeply, so
+%     those sites dominate the run (measured: kNN ~= 90% of the per-site cost, clean
+%     O(n^2)). The optional per-site spike cap (maxSpk_persite_clust, off by default)
+%     bounds this: a site with more than maxSpk spikes clusters a random subsample
+%     (clustering -> maxSpk points, kNN graph -> O(maxSpk^2)) and assigns the rest to
+%     the nearest subset member (cluster_site_capped_). The only residual cost that
+%     still scales with the full site size is one 1-NN assignment pass (O(n1*maxSpk),
+%     chunked BLAS), so a 1.1M-spike site drops from ~80 min to ~90 s (measured, m=50k:
+%     isosplit ~5 s + subset kNN + assignment ~86 s). See default.prm.
 function S_clu = S_clu_from_labels_(viClu, S0, P, t_runtime, miKnn, vrRho)
 % Build a valid S_clu from a final cluster-label vector (0 = noise/unassigned).
 % miKnn (knn x nSpk) and vrRho (nSpk x 1) are the kNN graph + density from the
@@ -2403,6 +2430,15 @@ if nargin<5, miKnn = []; end
 if nargin<6, vrRho = []; end
 global trFet_spk
 viClu = int32(viClu(:));
+% Make positive labels contiguous (1..nClu) so a gap in the input labels (possible
+% from an external/custom fh_cluster, e.g. CLASSIX) can't create an empty cluster id
+% that drops an icl entry below and misaligns icl with cluster numbers. 0 (noise) kept.
+% For the shipped methods labels are already dense+ascending, so this is the identity.
+vlPos = viClu > 0;
+if any(vlPos)
+    [~, ~, vi1] = unique(viClu(vlPos));
+    viClu(vlPos) = int32(vi1);
+end
 nSpk = numel(viClu);
 nClu = double(max([0; double(viClu)]));
 knn = get_set_(P, 'knn', 30);
@@ -2469,50 +2505,227 @@ function [viClu, miKnn, vrRho] = cluster_labels_persite_(S0, P, fh_cluster)
 % indices, which the waveform-based post-merge modes require.
 %   fh_cluster: @(X, P) -> integer label vector (0 = noise); X is (nSpk_site x nFet),
 %               one row per primary spike (full local feature vector).
+%
+% Detection sites are independent, so the per-site work (clustering + kNN graph)
+% runs in PARALLEL across CPU cores when fParfor=1 (default; see default.prm) and
+% the Parallel Computing Toolbox is available, falling back to a serial loop
+% otherwise. Both paths report running progress with an ETA, since the per-site
+% loop can take many minutes-to-hours for the heavier methods (e.g. ISO-SPLIT).
 global trFet_spk
 if isempty(trFet_spk)
     trFet_spk = load_bin_(strrep(P.vcFile_prm, '.prm', '_spkfet.jrc'), 'single', S0.dimm_fet);
 end
 nSites = numel(S0.cviSpk_site);
 nSpk = numel(S0.viTime_spk);
-viClu = zeros(nSpk, 1, 'int32');
 knn = get_set_(P, 'knn', 30);
-miKnn = repmat(int32(1:nSpk), knn, 1);   % safe self-referential default
-vrRho = ones(nSpk, 1, 'single');
 min_count = get_set_(P, 'min_count', 30);
-offset = 0;
-fprintf('\tPer-site clustering over %d sites\n\t', nSites);
+% Warn once if the per-site spike cap is set below min_count: cluster_site_ activates
+% the cap only when maxSpk >= max(2,min_count), so a smaller value silently disables it
+% and giant sites run fully uncapped (the O(n^2) blow-up the cap was meant to bound).
+maxSpk_warn = get_set_(P, 'maxSpk_persite_clust', []);
+if ~isempty(maxSpk_warn) && maxSpk_warn < max(2, min_count)
+    fprintf(2, '\tmaxSpk_persite_clust (%g) < min_count (%d): cap ignored, sites run uncapped.\n', ...
+        maxSpk_warn, max(2, min_count));
+end
+
+% Pre-slice each site's features (kept single to limit memory; cluster_site_ casts
+% to double) and its global spike indices, so the per-site loop body is data-parallel
+% (no shared/loop-carried state -> parfor-safe; labels are offset after the loop).
+[cmrX, cviSpk] = deal(cell(nSites, 1));
 for iSite = 1:nSites
-    viSpk1 = S0.cviSpk_site{iSite};
+    viSpk1 = S0.cviSpk_site{iSite}(:);
+    cviSpk{iSite} = viSpk1;
     if isempty(viSpk1), continue; end
-    viSpk1 = viSpk1(:);
     n1 = numel(viSpk1);
-    % full local feature vector per primary spike: n1 x (nSites_fet*nPcPerChan)
-    X = double(reshape(trFet_spk(:,:,viSpk1), [], n1)');
-    % --- cluster this site's spikes ---
-    if n1 < max(2, min_count)
-        viLabel = ones(n1, 1);   % too few spikes: one cluster (pruned later if tiny)
-    else
+    cmrX{iSite} = reshape(trFet_spk(:,:,viSpk1), [], n1)';   % n1 x nFet (single)
+end
+
+[cviLabel, cmiKnn, cvrRho] = deal(cell(nSites, 1));
+vnLabel = zeros(nSites, 1);   % #clusters found per site (for global label offsets)
+[vt_clu, vt_knn] = deal(zeros(nSites, 1));   % per-site CPU-time: clustering vs kNN graph
+
+fParfor = get_set_(P, 'fParfor', 1);
+% Cap the worker pool (default 8; 4-8 recommended) to avoid CPU/RAM oversubscription
+% -- each worker holds one site's features + kNN distance matrix, so more workers is
+% not always faster and can blow up memory on large recordings.
+nWorkers = max(1, round(get_set_(P, 'nWorkers_clust', 8)));
+% Clamp to what the local cluster profile actually permits. Requesting more than the
+% profile's NumWorkers throws ("Too many workers requested ..."), which would otherwise
+% drop us to the (much slower) serial path. To use more workers, raise the profile cap:
+%   c = parcluster('local'); c.NumWorkers = 12; saveProfile(c);
+nWorkersMax = feature('numcores');
+try
+    nWorkersMax = parcluster('local').NumWorkers;
+catch
+end
+nWorkers = min(nWorkers, nWorkersMax);
+progress_persite_('init', nSites);
+if fParfor
+    try
+        % reuse an existing pool when possible; otherwise size one to <= nWorkers
+        hPool = gcp('nocreate');
+        if isempty(hPool)
+            hPool = parpool('local', nWorkers);
+        elseif hPool.NumWorkers > nWorkers
+            delete(hPool);                       % shrink an over-sized pool to the cap
+            hPool = parpool('local', nWorkers);
+        end
+        nWorkers = hPool.NumWorkers;
+        hQueue = parallel.pool.DataQueue;
+        afterEach(hQueue, @progress_persite_);   % live progress from workers
+    catch ME0
+        % last resort before serial: try the profile's default-size pool
         try
-            viLabel = fh_cluster(X, P);
-        catch ME
-            fprintf(2, '\n\tsite %d clustering failed (%s); assigning single cluster\n\t', iSite, ME.message);
-            viLabel = ones(n1, 1);
+            hPool = gcp('nocreate');
+            if isempty(hPool), hPool = parpool('local'); end
+            nWorkers = hPool.NumWorkers;
+            hQueue = parallel.pool.DataQueue;
+            afterEach(hQueue, @progress_persite_);
+            fprintf(2, '\tpool sizing failed (%s); using default pool of %d workers\n', ME0.message, nWorkers);
+        catch
+            fprintf(2, '\tparpool setup failed (%s); using serial loop\n', ME0.message);
+            fParfor = 0;   % Parallel Computing Toolbox unavailable -> serial loop below
         end
     end
-    viLabel = double(viLabel(:));
-    vl = viLabel > 0;
-    if any(vl)
-        viClu(viSpk1(vl)) = int32(offset + viLabel(vl));
-        offset = offset + max(viLabel(vl));
-    end
-    % --- per-site kNN graph + density (global indices) for post-merge ---
-    [miKnn1, vrRho1] = persite_knn_(X', knn, viSpk1);
-    miKnn(:, viSpk1) = miKnn1;
-    vrRho(viSpk1) = vrRho1;
-    fprintf('.');
 end
-fprintf('\n');
+fprintf('\tPer-site clustering over %d sites (%s)\n', nSites, ...
+    ifeq_(fParfor, sprintf('parallel: %d workers', nWorkers), 'serial'));
+if fParfor
+    try
+        parfor (iSite = 1:nSites, nWorkers)
+            [cviLabel{iSite}, cmiKnn{iSite}, cvrRho{iSite}, vnLabel(iSite), vt_clu(iSite), vt_knn(iSite)] = ...
+                cluster_site_(cmrX{iSite}, cviSpk{iSite}, knn, min_count, fh_cluster, P);
+            send(hQueue, iSite);
+        end
+    catch ME
+        fprintf(2, '\n\tparallel clustering failed (%s); retrying serially\n', ME.message);
+        fParfor = 0;
+        progress_persite_('init', nSites);
+    end
+end
+if ~fParfor
+    for iSite = 1:nSites
+        [cviLabel{iSite}, cmiKnn{iSite}, cvrRho{iSite}, vnLabel(iSite), vt_clu(iSite), vt_knn(iSite)] = ...
+            cluster_site_(cmrX{iSite}, cviSpk{iSite}, knn, min_count, fh_cluster, P);
+        progress_persite_(iSite);
+    end
+end
+
+% --- assemble global outputs: offset each site's labels by the running cluster
+%     count of the preceding sites (cumulative sum reproduces the old serial offset)
+viClu = zeros(nSpk, 1, 'int32');
+miKnn = repmat(int32(1:nSpk), knn, 1);   % safe self-referential default
+vrRho = ones(nSpk, 1, 'single');
+viOffset = cumsum([0; vnLabel(:)]);       % viOffset(iSite) = #clusters before iSite
+for iSite = 1:nSites
+    viSpk1 = cviSpk{iSite};
+    if isempty(viSpk1), continue; end
+    viLabel = cviLabel{iSite};
+    if ~isempty(viLabel)
+        vl = viLabel > 0;
+        if any(vl), viClu(viSpk1(vl)) = int32(viOffset(iSite) + viLabel(vl)); end
+    end
+    if ~isempty(cmiKnn{iSite}), miKnn(:, viSpk1) = cmiKnn{iSite}; end
+    if ~isempty(cvrRho{iSite}), vrRho(viSpk1) = cvrRho{iSite}; end
+end
+
+% --- per-site work breakdown: clustering vs kNN graph (summed CPU-time across all
+%     sites). Tells us which stage to optimize next (e.g. GPU the kNN if it dominates).
+vn1 = cellfun(@numel, cviSpk);
+t_clu_tot = sum(vt_clu); t_knn_tot = sum(vt_knn); t_work = t_clu_tot + t_knn_tot;
+if t_work > 0
+    fprintf('\tPer-site work (summed CPU-time over %d sites): clustering %.0fs (%.0f%%) + kNN %.0fs (%.0f%%) = %.0fs\n', ...
+        nSites, t_clu_tot, 100*t_clu_tot/t_work, t_knn_tot, 100*t_knn_tot/t_work, t_work);
+    [~, viSrt] = sort(vt_clu + vt_knn, 'descend');
+    nTop = min(5, nSites);
+    fprintf('\ttop %d sites by time:', nTop);
+    for ii = 1:nTop
+        is = viSrt(ii);
+        fprintf(' [site %d: %d spk, clu %.1fs + knn %.1fs]', is, vn1(is), vt_clu(is), vt_knn(is));
+    end
+    fprintf('\n');
+end
+end %func
+
+
+%--------------------------------------------------------------------------
+function [viLabel, miKnn1, vrRho1, nLabel, t_clu, t_knn] = cluster_site_(X, viSpk1, knn, min_count, fh_cluster, P)
+% Cluster one detection site's spikes and build its global-index kNN graph.
+% X: n1 x nFet (single, rows = spikes); viSpk1: that site's global spike indices.
+% Returns local labels (0=noise), the knn x n1 global-index kNN graph, density rho
+% (n1 x 1 = 1/dist-to-kth-neighbor), the site's cluster count nLabel, and the CPU-time
+% spent on clustering (t_clu) vs the kNN graph (t_knn). Pure of shared state so it is
+% safe to call from parfor.
+viSpk1 = viSpk1(:);
+n1 = numel(viSpk1);
+[t_clu, t_knn] = deal(0, 0);
+if n1 == 0
+    [viLabel, miKnn1, vrRho1, nLabel] = deal(zeros(0,1), zeros(knn,0,'int32'), zeros(0,1,'single'), 0);
+    return;
+end
+X = double(X);
+% --- optional per-site spike cap: on huge (usually noise) channels, cluster a
+%     random subsample of maxSpk spikes and propagate the result to the rest.
+%     Bounds BOTH the O(n1^2) kNN graph and the clustering cost. Off by default
+%     (maxSpk_persite_clust = []); only sites with n1 > maxSpk are affected. ---
+maxSpk = get_set_(P, 'maxSpk_persite_clust', []);
+if ~isempty(maxSpk) && n1 > maxSpk && maxSpk >= max(2, min_count)
+    [viLabel, miKnn1, vrRho1, nLabel, t_clu, t_knn] = ...
+        cluster_site_capped_(X, viSpk1, knn, round(maxSpk), fh_cluster, P);
+    return;
+end
+% --- cluster this site's spikes ---
+hT = tic;
+if n1 < max(2, min_count)
+    viLabel = ones(n1, 1);   % too few spikes: one cluster (pruned later if tiny)
+else
+    try
+        viLabel = fh_cluster(X, P);
+    catch ME
+        fprintf(2, '\n\tsite (%d spikes) clustering failed (%s); assigning single cluster\n', n1, ME.message);
+        viLabel = ones(n1, 1);
+    end
+end
+t_clu = toc(hT);
+viLabel = double(viLabel(:));
+nLabel = max([0; viLabel(viLabel > 0)]);
+% --- per-site kNN graph + density (global indices) for post-merge ---
+% Guard the O(n1^2) kNN step: on a huge UNCAPPED site it can OOM/throw. Without this
+% the serial loop in cluster_labels_persite_ would abort the whole (multi-hour) sort
+% instead of degrading this one site. Fallback = self-referential kNN + uniform rho
+% (same shapes/types as a normal return); the spike labels from fh_cluster are kept.
+hT = tic;
+try
+    [miKnn1, vrRho1] = persite_knn_(X', knn, viSpk1);
+catch ME
+    fprintf(2, '\n\tsite (%d spikes) kNN graph failed (%s); self-referential fallback\n', n1, ME.message);
+    miKnn1 = repmat(int32(viSpk1(:)'), knn, 1);   % each spike -> itself (valid global idx)
+    vrRho1 = ones(n1, 1, 'single');
+end
+t_knn = toc(hT);
+end %func
+
+
+%--------------------------------------------------------------------------
+function progress_persite_(arg, nTotal)
+% Progress / ETA reporter for the per-site clustering loop. Call once with
+% ('init', nSites) to reset, then once per completed site with the site index
+% (numeric). Works both as a parallel.pool.DataQueue afterEach callback (parallel
+% path) and as a direct per-iteration tick (serial path); state is kept on the
+% client in a persistent so worker-side calls never occur.
+persistent nDone N tStart
+if ischar(arg)
+    nDone = 0; N = nTotal; tStart = tic; return;
+end
+nDone = nDone + 1;
+nStep = max(1, round(N / 50));   % refresh ~50 times over the run
+if mod(nDone, nStep) == 0 || nDone >= N
+    tElapsed = toc(tStart);
+    tRemain = tElapsed / max(nDone, 1) * max(N - nDone, 0);
+    fprintf('\r\t  %d/%d sites done  (%.0fs elapsed, ~%.0fs remaining)        ', ...
+        nDone, N, tElapsed, tRemain);
+    if nDone >= N, fprintf('\n'); end
+end
 end %func
 
 
@@ -2536,6 +2749,78 @@ end %func
 
 
 %--------------------------------------------------------------------------
+function [viLabel, miKnn1, vrRho1, nLabel, t_clu, t_knn] = cluster_site_capped_(X, viSpk1, knn, m, fh_cluster, P)
+% Capped per-site clustering (see maxSpk_persite_clust). Clusters a random
+% subsample of m spikes, builds the kNN graph on that subset, then assigns ALL
+% n1 spikes to their nearest subset member -- copying its label, kNN row and
+% density. Bounds the clustering to m points and the kNN graph to O(m^2) on
+% giant sites, while still emitting a label, a global-index kNN row and a
+% density for every spike (so S_clu_from_labels_ / post_merge_ are unaffected).
+% Pure of shared state -> parfor-safe. Timing mirrors cluster_site_:
+% t_clu = subsample+cluster, t_knn = subset kNN graph + nearest-member assignment.
+n1 = size(X, 1);
+% Deterministic per-site subsample (seeded by the first global spike id) so the
+% chosen subset is identical under serial and parfor; restore the RNG afterward
+% so the clustering itself behaves exactly as it would on an uncapped site.
+sRng = rng(); rng(double(viSpk1(1)), 'twister');
+viSub = sort(randperm(n1, m));
+rng(sRng);
+Xsub = X(viSub, :);
+viSpkSub = viSpk1(viSub);
+% --- cluster the subset ---
+hT = tic;
+try
+    viLabelSub = fh_cluster(Xsub, P);
+catch ME
+    fprintf(2, '\n\tsite (%d spikes, capped to %d) clustering failed (%s); assigning single cluster\n', n1, m, ME.message);
+    viLabelSub = ones(m, 1);
+end
+viLabelSub = double(viLabelSub(:));
+t_clu = toc(hT);
+nLabel = max([0; viLabelSub(viLabelSub > 0)]);
+% --- subset kNN graph (global indices) + assign every spike to its nearest
+%     subset member (1-NN), copying that member's label, kNN row and density.
+%     A subset member is its own nearest (distance 0) -> keeps its own values. ---
+hT = tic;
+try
+    [miKnnSub, vrRhoSub] = persite_knn_(Xsub', knn, viSpkSub);
+    viNN = nearest_in_set_(X', Xsub');     % n1 x 1, index into the m subset members
+    viLabel = viLabelSub(viNN);
+    miKnn1 = miKnnSub(:, viNN);
+    vrRho1 = vrRhoSub(viNN);
+catch ME
+    % Bounded m makes this unlikely, but degrade gracefully rather than kill the sort.
+    % Collapse the site to ONE cluster (nLabel=1) so no label gap is created.
+    fprintf(2, '\n\tsite (%d spikes, capped to %d) kNN/assign failed (%s); single-cluster fallback\n', n1, m, ME.message);
+    viLabel = ones(n1, 1);
+    nLabel = 1;
+    miKnn1 = repmat(int32(viSpk1(:)'), knn, 1);
+    vrRho1 = ones(n1, 1, 'single');
+end
+t_knn = toc(hT);
+end %func
+
+
+%--------------------------------------------------------------------------
+function viNN = nearest_in_set_(mrFet_all, mrFet_sub)
+% For each column of mrFet_all (nFet x n1), return the index (1..m) of the
+% nearest column in mrFet_sub (nFet x m) by Euclidean distance. Chunked over the
+% queries (like knn_cpu_) so the pdist2 distance block stays bounded in memory.
+% Pure of shared state -> parfor-safe. Used by the per-site spike cap to assign
+% every spike to its nearest clustered subsample member.
+n1 = size(mrFet_all, 2);
+viNN = zeros(n1, 1);
+mrSub_T = mrFet_sub';            % m x nFet (the searched set)
+nStep = 10000;                   % larger blocks = fewer calls + better BLAS efficiency
+for i1 = 1:nStep:n1
+    vi_ = i1:min(i1+nStep-1, n1);
+    [~, ix] = pdist2(mrSub_T, mrFet_all(:,vi_)', 'euclidean', 'Smallest', 1);
+    viNN(vi_) = ix(:);
+end
+end %func
+
+
+%--------------------------------------------------------------------------
 function S_clu = cluster_kmeans_(S0, P)
 % Per-site k-means clustering (label-based; bypasses density-peak clustering).
 % Over-segments each site into k clusters; post_merge_ collapses redundant ones.
@@ -2545,7 +2830,10 @@ k = get_set_(P, 'kmeans_k', []);
 if isempty(k), k = get_set_(P, 'maxCluPerSite', 20); end
 nReplicates = get_set_(P, 'kmeans_replicates', 3);
 vcDistance = get_set_(P, 'kmeans_distance', 'sqeuclidean');
-fh = @(X, Pp)kmeans_labels_(X, k, nReplicates, vcDistance);
+opts = struct('MaxIter', get_set_(P, 'kmeans_max_iter', 100), ...
+              'Start', get_set_(P, 'kmeans_start', 'plus'), ...
+              'OnlinePhase', get_set_(P, 'kmeans_online', 'off'));
+fh = @(X, Pp)kmeans_labels_(X, k, nReplicates, vcDistance, opts);
 [viClu, miKnn, vrRho] = cluster_labels_persite_(S0, P, fh);
 S_clu = S_clu_from_labels_(viClu, S0, P, toc(t_func), miKnn, vrRho);
 fprintf('\tk-means: %d clusters, took %0.1fs\n', S_clu.nClu, S_clu.t_runtime);
@@ -2553,12 +2841,16 @@ end %func
 
 
 %--------------------------------------------------------------------------
-function viLabel = kmeans_labels_(X, k, nReplicates, vcDistance)
+function viLabel = kmeans_labels_(X, k, nReplicates, vcDistance, opts)
+if nargin<5, opts = struct(); end
 n = size(X,1);
 k = min(k, max(1, floor(n/2)));   % cannot have more clusters than (half the) points
 if k <= 1, viLabel = ones(n,1); return; end
 viLabel = kmeans(X, k, 'Replicates', nReplicates, 'Distance', vcDistance, ...
-    'EmptyAction', 'singleton', 'OnlinePhase', 'off');
+    'EmptyAction', 'singleton', ...
+    'OnlinePhase', get_set_(opts, 'OnlinePhase', 'off'), ...
+    'Start', get_set_(opts, 'Start', 'plus'), ...
+    'MaxIter', get_set_(opts, 'MaxIter', 100));
 end %func
 
 
@@ -2570,7 +2862,9 @@ fprintf('HDBSCAN clustering (per-site, bypassing DPC)...\n'); t_func = tic;
 minClusterSize = get_set_(P, 'hdbscan_minClusterSize', []);
 if isempty(minClusterSize), minClusterSize = get_set_(P, 'min_count', 30); end
 minPts = get_set_(P, 'hdbscan_minPts', 10);
-fh = @(X, Pp)hdbscan_fit(X, minClusterSize, minPts);
+opts = struct('k_graph', get_set_(P, 'hdbscan_k_graph', []), ...
+              'allow_single_cluster', get_set_(P, 'hdbscan_allow_single', 0));
+fh = @(X, Pp)hdbscan_fit(X, minClusterSize, minPts, opts);
 [viClu, miKnn, vrRho] = cluster_labels_persite_(S0, P, fh);
 S_clu = S_clu_from_labels_(viClu, S0, P, toc(t_func), miKnn, vrRho);
 fprintf('\tHDBSCAN: %d clusters, took %0.1fs\n', S_clu.nClu, S_clu.t_runtime);
@@ -2583,8 +2877,13 @@ function S_clu = cluster_isosplit_(S0, P)
 % Tries isosplit6 (Python bridge) and falls back to pure-MATLAB isosplit5.
 fprintf('ISO-SPLIT clustering (per-site, bypassing DPC)...\n'); t_func = tic;
 iVer = get_set_(P, 'isosplit_version', 6);
-isocut_threshold = get_set_(P, 'isosplit_isocut_threshold', 1.0);
-fh = @(X, Pp)isosplit_labels_(X, iVer, isocut_threshold);
+opts = struct();
+opts.isocut_threshold     = get_set_(P, 'isosplit_isocut_threshold', 1.0);
+opts.min_cluster_size     = get_set_(P, 'isosplit_min_cluster_size', 10);
+opts.K_init               = get_set_(P, 'isosplit_K_init', 200);
+opts.max_iterations       = get_set_(P, 'isosplit_max_iterations', 1000);
+opts.whiten_cluster_pairs = get_set_(P, 'isosplit_whiten', 1);
+fh = @(X, Pp)isosplit_labels_(X, iVer, opts);
 [viClu, miKnn, vrRho] = cluster_labels_persite_(S0, P, fh);
 S_clu = S_clu_from_labels_(viClu, S0, P, toc(t_func), miKnn, vrRho);
 fprintf('\tISO-SPLIT: %d clusters, took %0.1fs\n', S_clu.nClu, S_clu.t_runtime);
@@ -2592,10 +2891,10 @@ end %func
 
 
 %--------------------------------------------------------------------------
-function viLabel = isosplit_labels_(X, iVer, isocut_threshold)
+function viLabel = isosplit_labels_(X, iVer, opts)
 % ISO-SPLIT expects features as (nDims x nSamples); X is (nSamples x nDims).
+if nargin<3, opts = struct(); end
 Xt = X';
-opts = struct('isocut_threshold', isocut_threshold);
 viLabel = [];
 if iVer >= 6
     try
@@ -3571,13 +3870,23 @@ function [S_clu, S0] = post_merge_(S_clu, P, fPostCluster)
 % also removes duplicate spikes
 if nargin<3, fPostCluster=1; end
 
+% Label-based clustering (kmeans/hdbscan/isosplit/classix) assigns final cluster labels
+% directly and bypasses density-peak clustering (DPC). postCluster_ re-runs DPC assignment
+% from S_clu.icl, which is empty for these methods (see "assigning clusters, nClu:0"), so it
+% wipes S_clu.viClu and collapses everything into a single cluster. Detect label-based
+% clustering -- via the flag set by the clusterer, or the active vcCluster (robust when the
+% saved _jrc.mat predates the flag) -- and skip postCluster_ so 'auto' preserves the labels.
+fLabelClu = get_set_(S_clu, 'fLabelClu', 0) || ...
+    ismember(lower(get_set_(P, 'vcCluster', '')), {'kmeans', 'hdbscan', 'isosplit', 'isosplit5', 'isosplit6', 'classix'});
+
 nRepeat_merge = get_set_(P, 'nRepeat_merge', 10);
 % refresh clu, start with fundamentals
 S_clu = struct_copy_(S_clu, 'rho', 'delta', 'ordrho', 'nneigh', 'P', ...
     't_runtime', 'halo', 'viiSpk', 'trFet_dim', 'vrDc2_site', 'miKnn', ...
     'viClu', 'icl', 'S_drift');
+S_clu.fLabelClu = fLabelClu;  % preserve across struct_copy_ so the saved _jrc.mat keeps the bypass
 
-if fPostCluster, S_clu = postCluster_(S_clu, P); end
+if fPostCluster && ~fLabelClu, S_clu = postCluster_(S_clu, P); end
 
 S_clu = S_clu_refresh_(S_clu);
 
@@ -3618,6 +3927,17 @@ switch get_set_(P, 'post_merge_mode', 1)
     otherwise, fprintf('No post-merge is performed\n'); 
 end %switch
 
+if fLabelClu && get_set_(P, 'maxWavCor', 1) > 0 && get_set_(P, 'maxWavCor', 1) < 1
+    % Label-based per-site clustering (kmeans/hdbscan/isosplit/classix) splits one neuron's
+    % spikes into separate clusters on adjacent sites. templateMatch_post_ (post_merge_mode=1)
+    % only compares clusters that share an EXACT peak site, so cross-site duplicates never get
+    % scored (their similarity stays NaN) and nothing merges. post_merge_wav4_ is the
+    % position-based merge that DOES compare clusters with different peak sites on their
+    % overlapping site-neighborhoods (irc.m ~4133), using the same maxWavCor threshold. Run it
+    % here with a generous radius (maxDist_site_um, ~55um) so cross-site duplicates collapse.
+    % post_merge_wav4_ refreshes S_clu and recomputes centroids from mrPos_spk internally.
+    S_clu = post_merge_wav4_(S_clu, get_set_(P, 'maxDist_site_um', 50), P);
+end
 S_clu = post_merge_wav_(S_clu, 0, P);
 S_clu = S_clu_sort_(S_clu, 'viSite_clu');
 S_clu = S_clu_refrac_(S_clu, P); % refractory violation removal
@@ -3976,7 +4296,9 @@ if fMerge
         S_clu = post_merge_wav4_(S_clu, merge_thresh, P);
     end %if
     nClu_merge = nClu_pre - S_clu.nClu; % positive count of merged clusters
-    fprintf('DEBUG post_merge_wav_: nClu_pre=%d, S_clu.nClu=%d, nClu_merge=%d\n', nClu_pre, S_clu.nClu, nClu_merge);
+    if get_set_(P, 'fVerbose', 0)
+        fprintf('\tpost_merge_wav_: nClu %d -> %d (%d merged)\n', nClu_pre, S_clu.nClu, nClu_merge);
+    end
     if nClu_merge==0, return; end % do not change anything if no merge occurred
 end
 
@@ -3995,7 +4317,10 @@ if fRemove_duplicate && dimm1(2) >= get_set_(P, 'nChans_min_car', 8) && ndims(di
         fprintf('%d duplicate units removed\n', sum(~vlKeep_clu));
     end    
 end
-nClu_merge = S_clu.nClu - nClu_pre;
+nClu_merge = nClu_pre - S_clu.nClu;  % positive = #clusters removed (merged + de-duplicated).
+% NB: sign matters - merge_auto_ (GUI "Merge auto") commits only when nClu_merge>0. A refactor
+% had flipped this to S_clu.nClu-nClu_pre (always <=0), so GUI merges were computed then silently
+% discarded with a "No clusters are merged" popup. Keep this consistent with line ~4298.
 end %func
 
 
@@ -4048,7 +4373,12 @@ ctrWav_sub_clu = cellfun(@(vi_)single(tnWav_spk(:,:,vi_)), cviSpk_sub_clu, 'Unif
 cviTime_sub_clu = cellfun(@(vi_)viTime_spk(vi_), cviSpk_sub_clu, 'UniformOutput', 0);
 
 % determine cluster centers
-mrPos_clu = cell2mat(cellfun(@(x)median(mrPos_spk(x,:))', cviSpk_sub_clu, 'UniformOutput', 0))';
+% median(0×nPos) without an explicit dim returns scalar NaN on some MATLAB
+% versions, making the transposed cell nPos×1 vs 1×1 → cell2mat fails.
+% Specifying dim 1 always yields 1×nPos (NaN-filled for empty); reshape pins
+% it to nPos×1 so all cells are consistent.
+nPos = size(mrPos_spk, 2);
+mrPos_clu = cell2mat(cellfun(@(x)reshape(median(mrPos_spk(x,:), 1), nPos, 1), cviSpk_sub_clu, 'UniformOutput', 0))';
 % Safety: ensure mrPos_clu has nClu rows (pad NaN for any missing)
 if size(mrPos_clu,1) < nClu
     mrPos_clu(end+1:nClu,:) = NaN;
@@ -4100,8 +4430,11 @@ for iClu1 = 1:nClu
         end
         [viSpk1_, viiSpk1_] = sortby_(viSpk1, min(mrDist21,[],1), 'ascend');
         [viSpk2_, viiSpk2_] = sortby_(viSpk2, min(mrDist21,[],2), 'ascend');
-        [viSpk1_, viiSpk1_] = deal(viSpk1_(1:end*FRAC_NEAR), viiSpk1_(1:end*FRAC_NEAR));
-        [viSpk2_, viiSpk2_] = deal(viSpk2_(1:end*FRAC_NEAR), viiSpk2_(1:end*FRAC_NEAR));
+        % max(1,..) guards a single-spike sub-cluster: end*FRAC_NEAR = 0.5 makes
+        % 1:0.5 empty -> mode([])=NaN -> miSites(:,NaN) crash. Behaviour is
+        % unchanged for >=2 spikes (max only binds when end*FRAC_NEAR < 1).
+        [viSpk1_, viiSpk1_] = deal(viSpk1_(1:max(1,end*FRAC_NEAR)), viiSpk1_(1:max(1,end*FRAC_NEAR)));
+        [viSpk2_, viiSpk2_] = deal(viSpk2_(1:max(1,end*FRAC_NEAR)), viiSpk2_(1:max(1,end*FRAC_NEAR)));
         [viSite_spk1_, viSite_spk2_] = deal(viSite_spk1(viiSpk1_), viSite_spk2(viiSpk2_));
         [iSite1_, iSite2_] = deal(mode(viSite_spk1_), mode(viSite_spk2_));
         [viSite1_, viSite2_] = deal(miSites(:,iSite1_), miSites(:,iSite2_));
@@ -7058,9 +7391,13 @@ nClu = double(max(S_clu.viClu));
 S_clu.nClu = nClu;
 if nargin<3, viSite_spk = get0_('viSite_spk'); end
 S_clu.cviSpk_clu = vi2cell_(S_clu.viClu, nClu);
-S_clu.vnSpk_clu = cellfun(@numel, S_clu.cviSpk_clu); 
+S_clu.vnSpk_clu = cellfun(@numel, S_clu.cviSpk_clu);
 if ~isempty(viSite_spk)
-    S_clu.viSite_clu = double(arrayfun(@(iClu)mode(viSite_spk(S_clu.cviSpk_clu{iClu})), 1:nClu));
+    % double() inside mode keeps arrayfun outputs uniformly double: viSite_spk is
+    % int32, and mode(int32([])) (an empty cluster, before removal below) can return
+    % a double NaN -> non-uniform class -> arrayfun errors. NaN entries are dropped
+    % by S_clu_remove_empty_.
+    S_clu.viSite_clu = double(arrayfun(@(iClu)mode(double(viSite_spk(S_clu.cviSpk_clu{iClu}))), 1:nClu));
 end
 if fRemoveEmpty, [S_clu, vlKeep_clu] = S_clu_remove_empty_(S_clu); end
 end %func
@@ -7079,7 +7416,9 @@ S_clu.cviSpk_clu = vi2cell_(S_clu.viClu);
 S_clu.nClu = numel(S_clu.cviSpk_clu); % update cluster count after remapping
 S_clu.vnSpk_clu = cellfun(@numel, S_clu.cviSpk_clu);
 viSite_spk = get0_('viSite_spk');
-S_clu.viSite_clu = double(arrayfun(@(iClu)mode(viSite_spk(S_clu.cviSpk_clu{iClu})), 1:S_clu.nClu));
+% double() inside mode keeps arrayfun outputs uniformly double (viSite_spk is int32;
+% mode(int32([])) on an empty remapped cluster can return double NaN -> class mismatch).
+S_clu.viSite_clu = double(arrayfun(@(iClu)mode(double(viSite_spk(S_clu.cviSpk_clu{iClu}))), 1:S_clu.nClu));
 % remao note
 end %func
 
@@ -7794,15 +8133,21 @@ if isempty(S_fig)
     S_fig.cell_alim = get_lim_shank_(P);
     colormap jet;
     mouse_figure(hFig);
-    nSites = size(P.mrSiteXY,1);
-    % Use actual channel numbers from viSite2Chan, not sequential site numbers
-    viChan = get_(P, 'viSite2Chan', 1:nSites); % fallback to 1:nSites if viSite2Chan doesn't exist
-    csText = arrayfun(@(i)sprintf('%d', i), viChan, 'UniformOutput', 0);
-    S_fig.hText = text(P.mrSiteXY(:,1), P.mrSiteXY(:,2), csText, 'VerticalAlignment', 'bottom', 'HorizontalAlignment', 'left');    
+    % Build the selectable site-label sets (channel #, site #, region) and
+    % cycle among them with the [C] key (see keyPressFcn_FigMap_).
+    S_fig.csLabelMode = site_label_modes_(P);
+    S_fig.iLabelMode = 1;
+    csText = S_fig.csLabelMode(1).csText;
+    S_fig.hText = text(P.mrSiteXY(:,1) + 20, P.mrSiteXY(:,2), csText, 'VerticalAlignment', 'bottom', 'HorizontalAlignment', 'left');
     xlabel('X Position (\mum)');
     ylabel('Y Position (\mum)');
-else    
-    set(S_fig.hPatch, 'CData', mrVpp);    
+    S_fig.csHelp = { ...
+        '[C] cycle site labels: channel #, site #, region', ...
+        '[H] help', ...
+        '------------------', ...
+        'Region labels are read from the CSV named by the', ...
+        '.prm variable ''vcFile_site_region'' ("key,region" rows).'};
+    set(hFig, 'KeyPressFcn', @keyPressFcn_FigMap_);
 end
 try
     iShank1 = P.viShank_site(S_clu.viSite_clu(S0.iCluCopy));
@@ -7812,10 +8157,180 @@ catch
     axis_(S_fig.hAx, S_fig.alim);
     vcTitle = sprintf('Max: %0.1f uVpp', max(vrVpp));
 end
-title_(S_fig.hAx, vcTitle);
-set(S_fig.hAx, 'CLim', [0, max(vrVpp)]);
+S_fig.vcTitle_base = vcTitle;
+S_fig.vrVpp = vrVpp;
+title_(S_fig.hAx, FigMap_title_(S_fig));
+apply_FigMap_color_(S_fig, vrVpp); % Vpp (jet) or region (categorical) per label mode
 
 set(hFig, 'UserData', S_fig);
+end %func
+
+
+%--------------------------------------------------------------------------
+% Build the list of selectable site-label modes for the probe map (FigMap).
+% Each mode has .name (shown in the title) and .csText (per-site labels).
+% [C] in the probe map cycles: channel # -> site # -> region (if available).
+function S_modes = site_label_modes_(P)
+nSites = size(P.mrSiteXY, 1);
+viSite = (1:nSites)';
+viChan = get_set_(P, 'viSite2Chan', viSite);
+if numel(viChan) ~= nSites, viChan = viSite; end
+
+% Mode 1: channel number (default; matches previous probe-map behavior)
+S_modes(1).name = 'channel #';
+S_modes(1).csText = arrayfun(@(i)sprintf('%d', i), viChan(:), 'UniformOutput', 0);
+% Mode 2: sequential site index
+S_modes(2).name = 'site #';
+S_modes(2).csText = arrayfun(@(i)sprintf('%d', i), viSite, 'UniformOutput', 0);
+% Mode 3: region label from CSV (added only when the CSV is available).
+% Also color-code the probe-map boxes by region (one categorical color each).
+csRegion = load_site_region_(P);
+if ~isempty(csRegion)
+    [csUniq, ~, viRegion] = unique(csRegion, 'stable');
+    S_modes(3).name = 'region';
+    S_modes(3).csText = csRegion;
+    S_modes(3).viColor = viRegion(:);          % per-site region index (colormap row)
+    S_modes(3).mrColormap = region_colormap_(numel(csUniq));
+end
+end %func
+
+
+%--------------------------------------------------------------------------
+% Read per-site region labels from the CSV named by the .prm variable
+% 'vcFile_site_region'. The CSV holds "key,region" rows where key is either a
+% channel number (matched against viSite2Chan) or a 1-based site index. Returns
+% {} when the file is unset / missing / unparseable so callers skip the mode.
+function csRegion = load_site_region_(P)
+csRegion = {};
+vcFile = get_set_(P, 'vcFile_site_region', '');
+if isempty(vcFile), return; end
+if ~exist_file_(vcFile)
+    fprintf(2, 'load_site_region_: file not found: %s\n', vcFile);
+    return;
+end
+nSites = size(P.mrSiteXY, 1);
+viChan = get_set_(P, 'viSite2Chan', (1:nSites)');
+if numel(viChan) ~= nSites, viChan = (1:nSites)'; end
+
+% Parse "key,region" rows; skip blank lines and a non-numeric header row.
+csLines = file2cellstr_(vcFile);
+[vnKey, csLabel] = deal(nan(numel(csLines),1), cell(numel(csLines),1));
+nRow = 0;
+for iLine = 1:numel(csLines)
+    vcLine = strtrim(csLines{iLine});
+    if isempty(vcLine), continue; end
+    cs1 = strsplit(vcLine, ',');
+    if numel(cs1) < 2, continue; end
+    key1 = str2double(cs1{1});
+    if isnan(key1), continue; end % header/comment row
+    nRow = nRow + 1;
+    vnKey(nRow) = key1;
+    csLabel{nRow} = strtrim(cs1{2});
+end
+if nRow == 0
+    fprintf(2, 'load_site_region_: no "key,region" rows in %s\n', vcFile);
+    return;
+end
+[vnKey, csLabel] = deal(vnKey(1:nRow), csLabel(1:nRow));
+
+csRegion = repmat({'?'}, nSites, 1); % '?' marks sites the CSV does not cover
+% Strategy 1: key = channel number (match against viSite2Chan).
+[vlHit, viLoc] = ismember(viChan(:), vnKey);
+csRegion(vlHit) = csLabel(viLoc(vlHit));
+% Strategy 2: key = 1-based site index (fill sites still uncovered).
+vlBlank = strcmp(csRegion, '?');
+if any(vlBlank)
+    viBlank = find(vlBlank);
+    [vlHit2, viLoc2] = ismember(viBlank, vnKey);
+    csRegion(viBlank(vlHit2)) = csLabel(viLoc2(vlHit2));
+end
+end %func
+
+
+%--------------------------------------------------------------------------
+% Probe-map (FigMap) key handler: [C] cycles the site labels, [H] shows help.
+function keyPressFcn_FigMap_(hObject, event)
+hFig = hObject;
+S_fig = get(hFig, 'UserData');
+if isempty(S_fig), return; end
+switch lower(event.Key)
+    case 'c' % cycle site labels: channel # -> site # -> region
+        cycle_FigMap_label_(hFig, S_fig);
+    case 'h'
+        msgbox_(get_set_(S_fig, 'csHelp', {'[C] cycle site labels'}), 1);
+end
+end %func
+
+
+%--------------------------------------------------------------------------
+% Advance the probe-map site labels to the next available mode and redraw.
+function S_fig = cycle_FigMap_label_(hFig, S_fig)
+if nargin<2, S_fig = get(hFig, 'UserData'); end
+csLabelMode = get_(S_fig, 'csLabelMode');
+if isempty(csLabelMode) || ~isfield(S_fig, 'hText'), return; end
+nModes = numel(csLabelMode);
+iMode = mod(get_set_(S_fig, 'iLabelMode', 1), nModes) + 1;
+S_fig.iLabelMode = iMode;
+csText = csLabelMode(iMode).csText;
+for iSite = 1:min(numel(S_fig.hText), numel(csText))
+    set(S_fig.hText(iSite), 'String', csText{iSite});
+end
+apply_FigMap_color_(S_fig, get_set_(S_fig, 'vrVpp', [])); % recolor boxes for the mode
+title_(S_fig.hAx, FigMap_title_(S_fig)); % reflect the active mode
+set(hFig, 'UserData', S_fig);
+end %func
+
+
+%--------------------------------------------------------------------------
+% Compose the probe-map title: base "Max uVpp" text plus the active label mode.
+function vcTitle = FigMap_title_(S_fig)
+vcTitle = get_set_(S_fig, 'vcTitle_base', '');
+csLabelMode = get_(S_fig, 'csLabelMode');
+iMode = get_set_(S_fig, 'iLabelMode', 1);
+if ~isempty(csLabelMode) && iMode>=1 && iMode<=numel(csLabelMode)
+    vcTitle = sprintf('%s [%s]', vcTitle, csLabelMode(iMode).name);
+end
+end %func
+
+
+%--------------------------------------------------------------------------
+% Color the probe-map boxes: categorical by region when the region label
+% mode is active, otherwise by the selected cluster's Vpp (jet colormap).
+function apply_FigMap_color_(S_fig, vrVpp)
+if nargin<2, vrVpp = get_set_(S_fig, 'vrVpp', []); end
+csLabelMode = get_(S_fig, 'csLabelMode');
+iMode = get_set_(S_fig, 'iLabelMode', 1);
+S_mode = [];
+if ~isempty(csLabelMode) && iMode>=1 && iMode<=numel(csLabelMode)
+    S_mode = csLabelMode(iMode);
+end
+if ~isempty(S_mode) && isfield(S_mode, 'viColor') && ~isempty(S_mode.viColor)
+    % region mode: one categorical color per region (direct colormap index)
+    set(S_fig.hPatch, 'CData', repmat(S_mode.viColor(:)', [4, 1]), 'CDataMapping', 'direct');
+    colormap(S_fig.hAx, S_mode.mrColormap);
+elseif ~isempty(vrVpp)
+    % channel/site mode: scale by Vpp of the selected cluster
+    mx = max(vrVpp); if ~(mx > 0), mx = 1; end
+    set(S_fig.hPatch, 'CData', repmat(vrVpp(:)', [4, 1]), 'CDataMapping', 'scaled');
+    colormap(S_fig.hAx, 'jet');
+    set(S_fig.hAx, 'CLim', [0, mx]);
+end
+end %func
+
+
+%--------------------------------------------------------------------------
+% Return an nReg-by-3 categorical palette for region-coded probe-map boxes.
+function mrColor = region_colormap_(nReg)
+if nReg < 1, mrColor = [0.2 0.6 1]; return; end
+try
+    if nReg <= 7
+        mrColor = lines(nReg);
+    else
+        mrColor = hsv(nReg);
+    end
+catch
+    mrColor = jet(max(nReg, 1));
+end
 end %func
 
 
@@ -30813,6 +31328,7 @@ mrMean_site = zeros(nDrift, S_clu.nClu);
 for iClu = 1:S_clu.nClu
     viSpk1 = find(S_clu.viClu == iClu);
     viSpk1 = viSpk1(:);
+    if isempty(viSpk1), continue; end   % 0-spike cluster: leave empty cells, skip (else viSpk1(vii1) errors)
     viiSpk1 = round(linspace(1, numel(viSpk1), nDrift+1));
     [vlKeep_clu1, viSite_clu1] = deal(true(nDrift, 1), zeros(nDrift,1));
     trWav_clu1 = zeros(dimm_spk(1), dimm_spk(2), nDrift, 'single');
@@ -31092,6 +31608,7 @@ fprintf('\tComputing template\n\t'); t_template = tic;
 for iClu = 1:S_clu.nClu
     viSpk1 = find(S_clu.viClu == iClu);
     viSpk1 = viSpk1(:);
+    if isempty(viSpk1), continue; end   % 0-spike cluster: leave empty cells, skip (else viSpk1(vii1) errors)
     viiSpk1 = round(linspace(1, numel(viSpk1), nDrift+1));
     [vlKeep_clu1, viSite_clu1] = deal(true(nDrift, 1), zeros(nDrift,1));
     [trWav_clu1, trWav_b_clu1] = deal(zeros(size(tnWav_spk,1), size(tnWav_spk,2), nDrift, 'single'));
@@ -32046,8 +32563,16 @@ binsize = round(binsize_ms * P.sRateHz/1000); % 1 ms bin
 nbins_shift = ceil(burst_interval_ms / binsize_ms);
 cviTime_clu = arrayfun(@(x)viTime_spk(S_clu.viClu==x), 1:S_clu.nClu, 'UniformOutput', 0);
 nClu = numel(cviTime_clu);
+if nClu < 2
+    % Correlogram is undefined for fewer than 2 clusters. squareform(pdist(single point))
+    % returns a 0x0 matrix, which makes the mrDist_clu(:,iClu1) indexing below fail with
+    % "Index in position 2 exceeds array bounds." Return an empty/NaN matrix instead.
+    mrCC = nan(nClu);
+    fprintf('Computing correlogram...skipped (nClu=%d)\n', nClu);
+    return;
+end
 cviTime_b_clu = cellfun_(@(x)unique(int32(ceil(double(x(:))/binsize))), cviTime_clu);
-max_time = max(cellfun(@max, cviTime_b_clu));
+max_time = max(cellfun(@(x)max([int32(0); x(:)]), cviTime_b_clu));   % empty-cluster-safe: plain max([]) errors in cellfun
 fprintf('Computing correlogram...'); t1=tic;
 mnCC = nan(nClu);
 mrDist_clu = squareform(pdist(P.mrSiteXY(S_clu.viSite_clu,:)));
